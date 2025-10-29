@@ -1,7 +1,3 @@
-"""
-cli.py - Fixed and simplified CLI
-"""
-
 import argparse
 import sys
 from pathlib import Path
@@ -12,7 +8,8 @@ try:
     from qr import (
         StyledQRGenerator, 
         QRConfig, 
-        StyleConfig
+        StyleConfig,
+        AdvancedImageAnalyzer
     )
 except ImportError as e:
     print(f"Error importing modules: {e}")
@@ -129,6 +126,8 @@ Examples:
     
     # Create generator
     generator = StyledQRGenerator(qr_config, style_config)
+    
+    generator.image_analyzer = AdvancedImageAnalyzer()
     
     # Generate QR code
     try:

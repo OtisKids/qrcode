@@ -40,7 +40,8 @@ class StyleConfig:
     preserve_finder_patterns: bool = True  # Keep finder patterns clear
     module_style: str = "rounded"  # Options: square, rounded, circular, gapped
     use_image_overlay: bool = False  # Use image as overlay (experimental)
-    
+    mask_style: str = "advanced"  # Options: simple, advanced, gradient, organic, geometric
+    mask_gradient_width: int = 20  # For gradient style
 
 class ImageAnalyzer:
     """Analyzes input images to extract visual characteristics"""
@@ -213,6 +214,7 @@ class StyledQRGenerator:
         self.qr_config = qr_config or QRConfig()
         self.style_config = style_config or StyleConfig()
         self.image_analyzer = ImageAnalyzer()
+
     
     def _get_module_drawer(self, style: str):
         """Get appropriate module drawer based on style"""
@@ -467,14 +469,42 @@ class StyledQRGenerator:
             # Extract and apply shape mask
             if self.style_config.style_intensity > 0:
                 try:
-                    shape_mask = self.image_analyzer.extract_shape_mask(
-                        image_path, 
-                        qr_img.size
-                    )
+                    if self.style_config.mask_style == 'gradient':
+                        shape_mask = self.image_analyzer.extract_shape_mask_with_gradient(
+                            image_path, 
+                            qr_img.size,
+                            self.style_config.mask_gradient_width
+                        )
+                    elif self.style_config.mask_style in ['organic', 'geometric', 'splatter']:
+                        shape_mask = self.image_analyzer.create_artistic_mask(
+                            image_path,
+                            qr_img.size,
+                            self.style_config.mask_style
+                        )
+                    elif self.style_config.mask_style == 'advanced':
+                        # Use the enhanced mask if AdvancedImageAnalyzer is available
+                        if isinstance(self.image_analyzer, AdvancedImageAnalyzer):
+                            shape_mask = self.image_analyzer.extract_shape_mask(
+                                image_path,
+                                qr_img.size
+                            )
+                        else:
+                            # Fall back to simple mask
+                            shape_mask = ImageAnalyzer.extract_shape_mask(
+                                image_path,
+                                qr_img.size
+                            )
+                    else:  # 'simple' or default
+                        shape_mask = ImageAnalyzer.extract_shape_mask(
+                            image_path,
+                            qr_img.size
+                        )
+                        
                     qr_img = self._apply_shape_mask(qr_img, shape_mask)
-                    logger.info("Shape mask applied successfully")
+                    logger.info(f"Shape mask ({self.style_config.mask_style}) applied successfully")
                 except Exception as e:
                     logger.warning(f"Could not apply shape mask: {e}")
+
             
             # Create final image with background
             final_img = Image.new('RGB', qr_img.size, color_palette['light'])
@@ -556,44 +586,415 @@ class StyledQRGenerator:
         return qr_img
 
 
+    
+class AdvancedImageAnalyzer(ImageAnalyzer):
+    """Enhanced image analyzer with better shape extraction"""
+    
+    @staticmethod
+    def remove_background(image_path: str) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Advanced background removal using multiple techniques
+        
+        Args:
+            image_path: Path to input image
+            
+        Returns:
+            Tuple of (image array, mask array)
+        """
+        img = cv2.imread(str(image_path))
+        if img is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        # Try GrabCut for automatic foreground extraction
+        mask = np.zeros(img.shape[:2], np.uint8)
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+        
+        # Define rectangle around the image (assuming subject is centered)
+        height, width = img.shape[:2]
+        margin = min(height, width) // 10
+        rect = (margin, margin, width - margin * 2, height - margin * 2)
+        
+        try:
+            cv2.grabCut(img, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+            # Create binary mask
+            mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
+        except:
+            # Fallback to threshold-based segmentation
+            logger.warning("GrabCut failed, using threshold method")
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            _, mask2 = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        return img, mask2
+    
+    @staticmethod
+    def extract_shape_mask(image_path: str, target_size: Tuple[int, int]) -> Image.Image:
+        """
+        Extract the main subject's shape as a mask with high fidelity
+        
+        This improved version:
+        - Uses multiple segmentation techniques
+        - Preserves fine details
+        - Better handles complex shapes
+        - Maintains smooth boundaries
+        
+        Args:
+            image_path: Path to input image
+            target_size: Size to resize mask to
+            
+        Returns:
+            PIL Image mask with alpha channel
+        """
+        logger.info(f"Extracting enhanced shape mask from {image_path}")
+        
+        img = cv2.imread(str(image_path))
+        if img is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        original_size = (img.shape[1], img.shape[0])
+        
+        # Method 1: Saliency Detection (finds visually important regions)
+        saliency_mask = AdvancedImageAnalyzer._create_saliency_mask(img)
+        
+        # Method 2: Color-based segmentation
+        color_mask = AdvancedImageAnalyzer._create_color_segmentation_mask(img)
+        
+        # Method 3: Edge-aware segmentation
+        edge_mask = AdvancedImageAnalyzer._create_edge_based_mask(img)
+        
+        # Combine masks using weighted average
+        combined_mask = (
+            saliency_mask * 0.4 +
+            color_mask * 0.3 +
+            edge_mask * 0.3
+        )
+        
+        # Normalize to 0-255
+        combined_mask = np.clip(combined_mask, 0, 255).astype(np.uint8)
+        
+        # Apply morphological operations to clean up
+        combined_mask = AdvancedImageAnalyzer._clean_mask(combined_mask)
+        
+        # Convert to PIL Image
+        mask_img = Image.fromarray(combined_mask)
+        
+        # Resize with high-quality resampling
+        mask_img = mask_img.resize(target_size, Image.Resampling.LANCZOS)
+        
+        # Apply smart blur (preserves edges while smoothing)
+        mask_img = AdvancedImageAnalyzer._apply_smart_blur(mask_img)
+        
+        # Enhance contrast for better definition
+        mask_img = ImageEnhance.Contrast(mask_img).enhance(1.3)
+        
+        logger.info(f"Shape mask created: {mask_img.size}")
+        return mask_img
+    
+    @staticmethod
+    def _create_saliency_mask(img: np.ndarray) -> np.ndarray:
+        """
+        Create mask based on visual saliency (what draws attention)
+        
+        Args:
+            img: Input image
+            
+        Returns:
+            Saliency mask
+        """
+        # Convert to LAB color space for better perceptual analysis
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        
+        # Calculate mean color
+        mean_lab = cv2.mean(img)[:3]
+        
+        # Calculate distance from mean (salient regions differ from average)
+        diff = np.zeros(img.shape[:2], dtype=np.float32)
+        for i in range(3):
+            channel_diff = cv2.absdiff(lab[:, :, i], 
+                                       np.full_like(lab[:, :, i], mean_lab[i]))
+            diff += channel_diff.astype(np.float32)
+        
+        # Normalize
+        diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+        
+        # Apply Gaussian blur to smooth saliency map
+        saliency = cv2.GaussianBlur(diff, (25, 25), 0)
+        
+        # Threshold to create binary-ish mask
+        _, saliency = cv2.threshold(saliency, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        return saliency.astype(np.uint8)
+    
+    @staticmethod
+    def _create_color_segmentation_mask(img: np.ndarray) -> np.ndarray:
+        """
+        Create mask using color-based segmentation
+        
+        Args:
+            img: Input image
+            
+        Returns:
+            Color segmentation mask
+        """
+        # Convert to HSV for better color segmentation
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        # Use K-means clustering to find dominant regions
+        pixels = img.reshape((-1, 3)).astype(np.float32)
+        
+        # Reduce to 5 color clusters
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+        k = 5
+        _, labels, centers = cv2.kmeans(pixels, k, None, criteria, 10, 
+                                        cv2.KMEANS_PP_CENTERS)
+        
+        # Reshape labels back to image dimensions
+        labels = labels.reshape(img.shape[:2])
+        
+        # Find the dominant cluster (excluding edges which are likely background)
+        h, w = img.shape[:2]
+        margin = min(h, w) // 20
+        center_region = labels[margin:h-margin, margin:w-margin]
+        
+        # Get most common label in center (likely the subject)
+        unique, counts = np.unique(center_region, return_counts=True)
+        foreground_label = unique[np.argmax(counts)]
+        
+        # Create mask for this cluster
+        mask = (labels == foreground_label).astype(np.uint8) * 255
+        
+        # Include nearby clusters (similar colors)
+        foreground_center = centers[foreground_label]
+        for i, center in enumerate(centers):
+            if i != foreground_label:
+                dist = np.linalg.norm(center - foreground_center)
+                if dist < 100:  # Similar color threshold
+                    mask = np.maximum(mask, (labels == i).astype(np.uint8) * 255)
+        
+        return mask
+    
+    @staticmethod
+    def _create_edge_based_mask(img: np.ndarray) -> np.ndarray:
+        """
+        Create mask using edge detection and contour filling
+        
+        Args:
+            img: Input image
+            
+        Returns:
+            Edge-based mask
+        """
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Apply bilateral filter to reduce noise while preserving edges
+        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+        
+        # Multi-scale edge detection
+        edges1 = cv2.Canny(filtered, 30, 100)
+        edges2 = cv2.Canny(filtered, 50, 150)
+        edges3 = cv2.Canny(filtered, 70, 200)
+        
+        # Combine edges
+        edges = cv2.bitwise_or(edges1, cv2.bitwise_or(edges2, edges3))
+        
+        # Close gaps in edges
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        closed_edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        # Fill contours
+        contours, hierarchy = cv2.findContours(closed_edges, cv2.RETR_EXTERNAL, 
+                                               cv2.CHAIN_APPROX_SIMPLE)
+        
+        mask = np.zeros_like(gray)
+        
+        if contours:
+            # Sort contours by area
+            contours = sorted(contours, key=cv2.contourArea, reverse=True)
+            
+            # Take top contours that cover significant area
+            total_area = gray.shape[0] * gray.shape[1]
+            cumulative_area = 0
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > total_area * 0.01:  # At least 1% of image
+                    cv2.drawContours(mask, [contour], -1, 255, -1)
+                    cumulative_area += area
+                    
+                    # Stop if we've covered enough of the image
+                    if cumulative_area > total_area * 0.7:
+                        break
+        else:
+            # Fallback: use the whole image
+            mask = np.ones_like(gray) * 255
+        
+        return mask
+    
+    @staticmethod
+    def _clean_mask(mask: np.ndarray) -> np.ndarray:
+        """
+        Clean up mask using morphological operations
+        
+        Args:
+            mask: Input mask
+            
+        Returns:
+            Cleaned mask
+        """
+        # Remove small noise
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
+        
+        # Fill small holes
+        kernel_medium = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_medium, iterations=2)
+        
+        # Remove small disconnected components
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8, cv2.CV_32S)
+        
+        # Keep only components larger than 2% of image
+        min_size = mask.shape[0] * mask.shape[1] * 0.02
+        cleaned_mask = np.zeros_like(mask)
+        
+        for i in range(1, num_labels):  # Skip background (0)
+            if stats[i, cv2.CC_STAT_AREA] >= min_size:
+                cleaned_mask[labels == i] = 255
+        
+        # If nothing survives, return original
+        if np.sum(cleaned_mask) == 0:
+            return mask
+        
+        return cleaned_mask
+    
+    @staticmethod
+    def _apply_smart_blur(mask_img: Image.Image, edge_threshold: int = 30) -> Image.Image:
+        """
+        Apply blur that preserves edges while smoothing flat areas
+        
+        Args:
+            mask_img: Input mask image
+            edge_threshold: Threshold for edge detection
+            
+        Returns:
+            Blurred mask image
+        """
+        # Convert to numpy for processing
+        mask_array = np.array(mask_img)
+        
+        # Detect edges
+        edges = cv2.Canny(mask_array, edge_threshold, edge_threshold * 2)
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+        
+        # Apply different blur to edge and non-edge regions
+        strong_blur = cv2.GaussianBlur(mask_array, (15, 15), 0)
+        light_blur = cv2.GaussianBlur(mask_array, (5, 5), 0)
+        
+        # Combine: light blur on edges, stronger blur elsewhere
+        edge_mask = edges > 0
+        result = np.where(edge_mask, light_blur, strong_blur)
+        
+        return Image.fromarray(result.astype(np.uint8))
+    
+    @staticmethod
+    def extract_shape_mask_with_gradient(image_path: str, 
+                                        target_size: Tuple[int, int],
+                                        gradient_width: int = 20) -> Image.Image:
+        """
+        Extract mask with gradient edges for smoother integration
+        
+        Args:
+            image_path: Path to input image
+            target_size: Size to resize mask to
+            gradient_width: Width of gradient edge in pixels
+            
+        Returns:
+            PIL Image mask with gradient edges
+        """
+        logger.info(f"Extracting gradient shape mask from {image_path}")
+        
+        # Get base mask
+        base_mask = AdvancedImageAnalyzer.extract_shape_mask(image_path, target_size)
+        base_array = np.array(base_mask)
+        
+        # Create distance transform (distance from edge)
+        # Invert mask for distance transform
+        inverted = 255 - base_array
+        dist_transform = cv2.distanceTransform(inverted, cv2.DIST_L2, 5)
+        
+        # Normalize and create gradient
+        dist_transform = cv2.normalize(dist_transform, None, 0, 1.0, cv2.NORM_MINMAX)
+        
+        # Apply gradient only near edges
+        gradient_mask = np.where(
+            dist_transform < gradient_width,
+            (dist_transform / gradient_width) * 255,
+            255
+        ).astype(np.uint8)
+        
+        # Combine with original mask
+        final_mask = cv2.bitwise_and(base_array, gradient_mask)
+        
+        return Image.fromarray(final_mask)
+    
+    @staticmethod
+    def create_artistic_mask(image_path: str, 
+                           target_size: Tuple[int, int],
+                           style: str = 'organic') -> Image.Image:
+        """
+        Create artistic mask variations
+        
+        Args:
+            image_path: Path to input image
+            target_size: Target size
+            style: Style type ('organic', 'geometric', 'splatter')
+            
+        Returns:
+            Artistic mask
+        """
+        base_mask = AdvancedImageAnalyzer.extract_shape_mask(image_path, target_size)
+        mask_array = np.array(base_mask)
+        
+        if style == 'organic':
+            # Add organic, flowing edges
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            mask_array = cv2.morphologyEx(mask_array, cv2.MORPH_OPEN, kernel)
+            mask_array = cv2.GaussianBlur(mask_array, (21, 21), 0)
+            
+        elif style == 'geometric':
+            # Create geometric approximation
+            gray = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, target_size, interpolation=cv2.INTER_LANCZOS4)
+            edges = cv2.Canny(gray, 50, 150)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            mask_array = np.zeros(target_size[::-1], dtype=np.uint8)
+            if contours:
+                # Approximate with fewer points
+                largest = max(contours, key=cv2.contourArea)
+                epsilon = 0.02 * cv2.arcLength(largest, True)
+                approx = cv2.approxPolyDP(largest, epsilon, True)
+                cv2.drawContours(mask_array, [approx], -1, 255, -1)
+                
+        elif style == 'splatter':
+            # Create splatter/paint effect
+            # Add random variations
+            noise = np.random.normal(0, 30, mask_array.shape)
+            mask_array = np.clip(mask_array.astype(float) + noise, 0, 255).astype(np.uint8)
+            # Threshold to create discrete splatter
+            _, mask_array = cv2.threshold(mask_array, 127, 255, cv2.THRESH_BINARY)
+        
+        return Image.fromarray(mask_array)
+
+
+   
+
 def main():
     """Example usage of the styled QR generator"""
     
     print("=" * 60)
-    print("Custom QR Code Generator - Fixed Version")
+    print("Custom QR Code Generator")
     print("=" * 60)
     
-    # Example usage
-    print("\nUsage Example:")
-    print("-" * 60)
-    print("""
-from styled_qr_generator import StyledQRGenerator, QRConfig, StyleConfig
-
-# Create generator with configuration
-qr_config = QRConfig(
-    error_correction=qrcode.constants.ERROR_CORRECT_H,
-    box_size=10,
-    border=4
-)
-
-style_config = StyleConfig(
-    style_intensity=0.5,
-    module_style="rounded",  # rounded, circular, gapped, square
-    preserve_finder_patterns=True
-)
-
-generator = StyledQRGenerator(qr_config, style_config)
-
-# Generate QR code
-qr_image = generator.generate(
-    data="https://your-url.com",
-    image_path="banana.jpg",
-    output_path="banana_qr.png",
-    embed_image=True
-)
-
-print("QR code generated successfully!")
-    """)
     
     print("\nTroubleshooting Tips:")
     print("-" * 60)
@@ -602,7 +1003,6 @@ print("QR code generated successfully!")
     print("✓ Test generated QR codes with multiple scanner apps")
     print("✓ If styling fails, the generator falls back to simple QR")
     print("✓ Reduce style_intensity if QR code doesn't scan well")
-    
 
 if __name__ == "__main__":
     main()

@@ -5,8 +5,8 @@ qr_config:
   border: 4
 
 style_config:
-  style_intensity: 0.3  # 0.0 to 1.0
+  style_intensity: 0.4  # 0.0 to 1.0
   contrast_threshold: 0.4
   preserve_finder_patterns: true
-  module_style: square  # square, rounded, circular, gapped
-  use_gradient: false
+  module_style: rounded  # square, rounded, circular, gapped
+  use_gradient: true
